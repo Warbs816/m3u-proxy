@@ -23,8 +23,8 @@ else
   LOG_RANGE="$FROM_TAG..HEAD"
 fi
 
-# Collect commits
-COMMITS="$(git log "$LOG_RANGE" --pretty=format:"%s|||%h|||%an" --no-merges 2>/dev/null)"
+# Collect commits (tab-separated: subject, hash)
+COMMITS="$(git log "$LOG_RANGE" --pretty=format:"%s%x09%h" --no-merges 2>/dev/null)"
 
 if [ -z "$COMMITS" ]; then
   echo ""
@@ -39,7 +39,7 @@ PERF=()
 DOCS=()
 OTHER=()
 
-while IFS='|||' read -r subject hash author; do
+while IFS=$'\t' read -r subject hash; do
   [ -z "$subject" ] && continue
 
   # Match conventional commit prefixes
@@ -53,7 +53,7 @@ while IFS='|||' read -r subject hash author; do
     display="$subject"
   fi
 
-  entry="- $display (\`$hash\`) — $author"
+  entry="- $display (\`$hash\`)"
 
   case "$prefix" in
     feat)        FEATURES+=("$entry") ;;
@@ -94,6 +94,6 @@ print_section "Other Changes"   "${OTHER[@]+"${OTHER[@]}"}"
 
 echo ""
 echo "========================================"
-TOTAL=$(echo "$COMMITS" | grep -c '|||' || true)
+TOTAL=$(echo "$COMMITS" | grep -c $'\t' || true)
 echo " Total commits: $TOTAL"
 echo "========================================"
