@@ -114,7 +114,7 @@ class StreamInfo:
     bitrate_monitoring_started: bool = False
     # Silence detection - detect silent audio and trigger failover
     silence_check_start_time: Optional[float] = None
-    silence_audio_buffer: bytes = field(default_factory=bytes)
+    silence_audio_buffer: bytes = b''
     silence_count: int = 0
     silence_monitoring_started: bool = False
     # Last HTTP error status code from upstream - passed to failover resolver
@@ -313,7 +313,6 @@ class StreamManager:
                 'ffmpeg',
                 '-hide_banner',
                 '-nostats',
-                '-f', 'mpegts',
                 '-i', 'pipe:0',
                 '-vn',
                 '-af', f'silencedetect=noise={settings.SILENCE_THRESHOLD_DB}dB:d={settings.SILENCE_DURATION}',
@@ -340,6 +339,11 @@ class StreamManager:
             return silence_detected
 
         except asyncio.TimeoutError:
+            try:
+                process.kill()
+                await process.wait()
+            except Exception:
+                pass
             logger.warning(
                 f"Silence analysis timed out for stream {stream_id}, skipping check"
             )
@@ -1189,7 +1193,9 @@ class StreamManager:
                                     stream_info.silence_check_start_time = current_time
                                     stream_info.silence_audio_buffer = b''
                             else:
-                                stream_info.silence_audio_buffer += chunk
+                                # Cap buffer at 5MB to bound memory usage on high-bitrate streams
+                                if len(stream_info.silence_audio_buffer) < 5 * 1024 * 1024:
+                                    stream_info.silence_audio_buffer += chunk
 
                                 elapsed = current_time - (stream_info.silence_check_start_time or current_time)
                                 if elapsed >= settings.SILENCE_CHECK_INTERVAL:
