@@ -99,6 +99,9 @@ class Settings(BaseSettings):
     # Network Broadcast Configuration
     # Base directory for broadcast HLS output. Each network gets a subdirectory.
     HLS_BROADCAST_DIR: str = "/tmp/m3u-proxy-broadcasts"
+    # Enable GC for orphaned broadcast directories. Uses HLS_GC_INTERVAL and
+    # HLS_GC_AGE_THRESHOLD for scan interval and age threshold respectively.
+    BROADCAST_GC_ENABLED: bool = True
     # Timeout (seconds) for webhook callbacks to the broadcast creator when broadcasts end
     BROADCAST_CALLBACK_TIMEOUT: int = 3
     BROADCAST_MAX_START_RETRIES: int = 3

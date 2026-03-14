@@ -11,6 +11,7 @@ Manages FFmpeg processes for network broadcasting with:
 import asyncio
 import os
 import re
+import shutil
 import time
 import logging
 from dataclasses import dataclass
@@ -561,6 +562,12 @@ class BroadcastManager:
             getattr(settings, "BROADCAST_START_FAILURE_GRACE", 2.0)
         )
 
+        # Broadcast GC configuration (reuses HLS_GC_* thresholds)
+        self.broadcast_gc_enabled = bool(getattr(settings, "BROADCAST_GC_ENABLED", True))
+        self.broadcast_gc_interval = int(getattr(settings, "HLS_GC_INTERVAL", 600))
+        self.broadcast_gc_age_threshold = int(getattr(settings, "HLS_GC_AGE_THRESHOLD", 3600))
+        self._gc_task: Optional[asyncio.Task] = None
+
         # Ensure base directory exists
         os.makedirs(self.hls_base_dir, exist_ok=True)
         logger.info(f"BroadcastManager initialized with base dir: {self.hls_base_dir}")
@@ -799,9 +806,94 @@ class BroadcastManager:
 
             return True
 
+    async def start(self):
+        """Start background tasks (GC loop)."""
+        if self.broadcast_gc_enabled:
+            self._gc_task = asyncio.create_task(self._gc_loop())
+            logger.info(
+                f"Broadcast GC started (interval={self.broadcast_gc_interval}s, "
+                f"age_threshold={self.broadcast_gc_age_threshold}s)"
+            )
+
+    async def _gc_loop(self):
+        """Periodically scan for and remove stale broadcast directories."""
+        while True:
+            try:
+                await asyncio.sleep(self.broadcast_gc_interval)
+                await self._gc_broadcast_dirs()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Broadcast GC loop error: {e}")
+
+    async def _gc_broadcast_dirs(self):
+        """
+        Remove orphaned broadcast directories that are no longer active and
+        have not been modified within the age threshold.
+
+        Uses shutil.rmtree (unlike HLS GC which uses os.rmdir) because broadcast
+        directories contain .ts segments and .m3u8 playlists even after FFmpeg exits.
+        """
+        removed = skipped_active = skipped_too_young = 0
+
+        # Snapshot active dirs without holding the lock during I/O
+        async with self._lock:
+            active_dirs = {p.hls_dir for p in self.broadcasts.values()}
+
+        try:
+            entries = os.listdir(self.hls_base_dir)
+        except Exception as e:
+            logger.error(f"Broadcast GC: cannot list {self.hls_base_dir}: {e}")
+            return
+
+        now = time.time()
+        for entry in entries:
+            if not entry.startswith("broadcast_"):
+                continue
+
+            full_path = os.path.join(self.hls_base_dir, entry)
+            if not os.path.isdir(full_path):
+                continue
+
+            if full_path in active_dirs:
+                skipped_active += 1
+                continue
+
+            try:
+                age = now - os.path.getmtime(full_path)
+            except Exception:
+                continue
+
+            if age < self.broadcast_gc_age_threshold:
+                skipped_too_young += 1
+                continue
+
+            try:
+                shutil.rmtree(full_path)
+                removed += 1
+                logger.info(
+                    f"Broadcast GC: removed stale directory {full_path} (age={age:.0f}s)"
+                )
+            except Exception as e:
+                logger.error(f"Broadcast GC: failed to remove {full_path}: {e}")
+
+        if removed or skipped_active or skipped_too_young:
+            logger.info(
+                f"Broadcast GC: removed={removed}, skipped_active={skipped_active}, "
+                f"skipped_too_young={skipped_too_young}"
+            )
+
     async def shutdown(self):
         """Stop all broadcasts gracefully."""
         logger.info("Shutting down BroadcastManager...")
+
+        if self._gc_task and not self._gc_task.done():
+            self._gc_task.cancel()
+            try:
+                await self._gc_task
+            except asyncio.CancelledError:
+                pass
+
         async with self._lock:
             for network_id, process in list(self.broadcasts.items()):
                 try:

@@ -369,6 +369,7 @@ async def lifespan(app: FastAPI):
     stream_manager.set_event_manager(event_manager)
 
     await stream_manager.start()
+    await broadcast_manager.start()
 
     # Set up custom event handlers
     def log_event_handler(event: StreamEvent):
