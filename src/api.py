@@ -1692,6 +1692,52 @@ async def get_streams_by_metadata(
     }
 
 
+@app.get("/streams/counts-by-metadata", dependencies=[Depends(verify_token)])
+async def get_streams_counts_by_metadata(
+    field: str = Query(..., description="Metadata field to group by"),
+    values: str = Query(..., description="Comma-separated values to count"),
+    active_only: bool = Query(
+        True, description="Only count streams with active clients"
+    ),
+):
+    """
+    Return a stream count per metadata value in a single request.
+
+    Instead of calling /streams/by-metadata once per value (e.g. once per
+    provider profile), callers can pass all values at once and get a
+    {value: count} map back, iterating stream_manager.streams only once.
+    """
+    requested = [v.strip() for v in values.split(",") if v.strip()]
+    counts = {v: 0 for v in requested}
+
+    for stream_id, stream_info in stream_manager.streams.items():
+        if stream_info.is_variant_stream:
+            continue
+
+        if not stream_info.is_active:
+            continue
+
+        field_value = str(stream_info.metadata.get(field, ""))
+        if field_value not in counts:
+            continue
+
+        if active_only:
+            active_client_count = 0
+            if stream_id in stream_manager.stream_clients:
+                for client_id in stream_manager.stream_clients[stream_id]:
+                    if (
+                        client_id in stream_manager.clients
+                        and stream_manager.clients[client_id].is_connected
+                    ):
+                        active_client_count += 1
+            if active_client_count == 0:
+                continue
+
+        counts[field_value] += 1
+
+    return {"field": field, "counts": counts}
+
+
 @app.get("/streams/{stream_id}", dependencies=[Depends(verify_token)])
 async def get_stream_info(stream_id: str):
     """Get information about a specific stream"""
