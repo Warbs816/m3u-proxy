@@ -18,12 +18,12 @@ Join our [Discord](https://discord.gg/rS3abJ5dz7) server to ask questions and ge
 
 ### Core Streaming
 - 🚀 **Pure HTTP Proxy**: Zero transcoding, direct byte-for-byte streaming
-- 🎯 **Per-Client Connections**: Each client gets independent provider connection
-- ⚡ **Truly Ephemeral**: Provider connections open only when client consuming
+- 🔗 **Connection Sharing**: Multiple viewers share one upstream provider connection (HLS, Transcoded, and live Direct/TS streams)
+- ⚡️ **Truly Ephemeral**: Provider connections open only when clients are consuming; close when the last client disconnects
 - 📺 **HLS Support**: Optimized playlist and segment handling (.m3u8)
-- 📡 **Continuous Streams**: Direct proxy for .ts, .mp4, .mkv, .webm, .avi files
+- 📡 **Continuous Streams**: Primary/subscriber broadcast for .ts, .mp4, .mkv, .webm, .avi live streams
 - 🔄 **Real-time URL Rewriting**: Automatic playlist modification for proxied content
-- 📱 **Full VOD Support**: Byte-range requests, seeking, multiple positions
+- 📱 **Full VOD Support**: Per-client connections with byte-range requests and seeking
 - 🎬 **Strict Live TS Mode**: Enhanced stability for live MPEG-TS with pre-buffering & circuit breaker
 
 ### Performance & Reliability
@@ -545,7 +545,7 @@ python demo_events.py
 │   ├── pooled_stream_manager.py # Shared/pooling stream orchestration
 │   ├── redis_config.py      # Redis settings
 │   ├── redis_manager.py     # Redis coordination layer
-│   ├── stream_manager.py    # Per-client direct proxy core
+│   ├── stream_manager.py    # Live proxy core (broadcast model for direct/TS streams)
 │   └── transcoding.py       # FFmpeg transcoding pipeline
 ├── static/                  # Static assets (icons, images)
 ├── tests/                   # Test suite

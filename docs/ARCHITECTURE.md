@@ -4,34 +4,33 @@
 
 ### 🚀 **True Live Proxy Design**
 
-**Design Philosophy:** Direct per-client connections to providers with zero buffering or transcoding. Each client receives a pure byte-for-byte HTTP proxy connection.
+**Design Philosophy:** Efficient live proxying with connection sharing — multiple viewers share a single upstream provider connection. Each byte comes directly from the provider with no persistent buffering layer.
 
 **Implementation:** Separate streaming strategies based on stream type:
 
-#### 1. **Continuous Streams (.ts, .mp4, .mkv, etc.)**
-- **Direct byte-for-byte proxy** - Each client gets their own provider connection
-- **Truly ephemeral connections** - Provider connection opens ONLY when client starts consuming
-- **Immediate cleanup** - Connection closes the moment client stops
-- **No transcoding, no buffering** - Pure HTTP proxy
-- **Per-client failover** - Seamless failover without affecting other clients
+#### 1. **Continuous Streams (.ts, .mp4, .mkv, etc.) — Live**
+- **Primary/subscriber broadcast model** — the first client opens one upstream connection and broadcasts chunks to all subsequent clients via in-memory queues
+- **One provider connection per channel** — conserves provider connection slots regardless of viewer count
+- **Subscriber promotion** — if the primary disconnects, the longest-running subscriber takes over and inherits the upstream TCP connection with no gap
+- **Truly ephemeral** — provider connection closes when the last client disconnects
+- **No transcoding, no buffering** — pure byte-for-byte proxy
 
-```python
-# Each client gets independent connection
-Client A → Provider (independent connection)
-Client B → Provider (independent connection)
-Client C → Provider (independent connection)
+```
+Provider → primary → Client A (direct yield)
+                   ↘ Queue → Client B (subscriber)
+                   ↘ Queue → Client C (subscriber)
 ```
 
-#### 2. **HLS Streams (.m3u8)**
+#### 2. **VOD Streams (.ts, .mp4, .mkv, etc.) — Video on Demand**
+- Each client gets an **independent** provider connection for full seek support
+- Range headers honoured and forwarded upstream
+- Works correctly with all standard video players
+
+#### 3. **HLS Streams (.m3u8)**
 - Stream connections are shared (multiple clients, 1 stream connection)
 - On-demand segment fetching
 - Efficient playlist processing
 - Shared HTTP client with connection pooling
-
-#### 3. **VOD Streams with Range Support**
-- Full range request support for seeking
-- Each client can be at different positions
-- Works correctly with video players
 
 ### ⚡ **Performance Optimizations**
 
@@ -101,12 +100,12 @@ curl -X POST "http://localhost:8085/streams" \
   -d '{"url": "http://example.com/live.ts"}'
 
 # Start multiple clients simultaneously
-ffplay "http://localhost:8085/stream/{stream_id}" &  # Client 1
-ffplay "http://localhost:8085/stream/{stream_id}" &  # Client 2
-ffplay "http://localhost:8085/stream/{stream_id}" &  # Client 3
+ffplay "http://localhost:8085/stream/{stream_id}" &  # Client 1 — becomes primary
+ffplay "http://localhost:8085/stream/{stream_id}" &  # Client 2 — subscriber
+ffplay "http://localhost:8085/stream/{stream_id}" &  # Client 3 — subscriber
 ```
 
-**Result:** ✅ Each client gets independent provider connection with clean stream data
+**Result:** ✅ Only one upstream provider connection is opened; Clients 2 and 3 receive chunks via broadcast queues
 
 ### Test 2: Channel Zapping (Connection Cleanup)
 
@@ -194,26 +193,26 @@ STREAM_TIMEOUT=300
 
 ## Architecture Decision Record
 
-### Why Per-Client Connections for Continuous Streams?
+### Why Primary/Subscriber Broadcast for Live Continuous Streams?
 
-**Option A: Shared Buffer (V1 approach)**
-- ❌ Doesn't work for continuous streams
-- ❌ Timing/synchronization issues
-- ❌ Breaks VOD with multiple clients
-- ✅ Works for HLS segments (we keep this)
+**Option A: Per-Client Direct Connections**
+- ❌ Each viewer opens a separate upstream TCP connection
+- ❌ Wastes provider connection slots (2 viewers = 2 connections billed)
+- ❌ Providers may kill duplicate connections to the same stream
+- ✅ Simple — each client is fully independent
 
-**Option B: Per-Client Direct Proxy (V2 approach)**
-- ✅ Simple, correct, efficient
-- ✅ Each client independent
-- ✅ True live proxy as specified
-- ✅ No memory overhead
-- ✅ Clean failover per client
-- ✅ Works for all stream types
+**Option B: Primary/Subscriber Broadcast (current approach)**
+- ✅ One upstream connection per live channel, regardless of viewer count
+- ✅ Conserves provider connection slots
+- ✅ Subscriber promotion ensures continuity when the primary disconnects
+- ✅ Upstream TCP connection handed off on promotion — no reconnect gap
+- ✅ Per-subscriber queues — a slow client can't block others
+- ⚠️ VOD excluded — each VOD client still gets an independent connection for seek support
 
-**Verdict:** Option B is superior for continuous streams.
+**Verdict:** Option B is superior for live continuous streams. VOD retains per-client connections.
 
 ---
 
-**Version:** 2.0.0  
-**Date:** October 4, 2025  
+**Version:** 3.0.0
+**Date:** March 2026
 **Status:** Production Ready ✅
