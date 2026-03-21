@@ -93,6 +93,9 @@ class StreamInfo:
     transcode_process: Optional[asyncio.subprocess.Process] = None
     # Key used by the pooled manager to identify shared transcoding processes
     transcode_stream_key: Optional[str] = None
+    # Auto-remux flag - set when HLS master playlist has separate audio tracks
+    # and the stream is auto-upgraded to FFmpeg remux for IPTV client compatibility
+    auto_remux: bool = False
     # Strict Live TS Mode - improved handling for live MPEG-TS streams
     strict_live_ts: bool = False
     # Circuit breaker - track bad upstream endpoints temporarily
@@ -439,6 +442,26 @@ class StreamManager:
         await self.http_client.aclose()
         await self.live_stream_client.aclose()
         logger.info("Stream manager stopped")
+
+    @staticmethod
+    def _has_separate_audio_tracks(content: str) -> bool:
+        """Check if HLS master playlist has separate audio renditions with their own URIs.
+
+        Many IPTV clients (TiviMate, some VLC configurations) don't properly handle
+        HLS master playlists where audio is delivered as a separate rendition via
+        EXT-X-MEDIA TYPE=AUDIO with its own URI. This method detects such playlists
+        so the proxy can auto-upgrade them to FFmpeg remux.
+        """
+        try:
+            playlist = m3u8.loads(content)
+            if not playlist.is_variant:
+                return False
+            for media in playlist.media:
+                if media.type == "AUDIO" and media.uri:
+                    return True
+            return False
+        except Exception:
+            return False
 
     def _detect_stream_type(self, url: str) -> tuple[bool, bool, bool]:
         """Detect stream type: (is_hls, is_vod, is_live_continuous)"""
@@ -3746,6 +3769,39 @@ class StreamManager:
                     stream_info.current_url = final_url
                     logger.debug(
                         f"Sticky session: Locking stream {stream_id} to origin: {final_url}"
+                    )
+
+                # AUTO-REMUX: Detect master playlists with separate audio tracks.
+                # Many IPTV clients (TiviMate, etc.) don't handle EXT-X-MEDIA
+                # TYPE=AUDIO with separate URIs. Auto-upgrade to FFmpeg remux
+                # (copy codecs, no re-encoding) so video+audio are muxed into
+                # a single MPEG-TS stream that all clients can play.
+                if (
+                    not stream_info.is_transcoded
+                    and not stream_info.is_variant_stream
+                    and not stream_info.auto_remux
+                    and self.pooled_manager
+                    and self._has_separate_audio_tracks(content)
+                ):
+                    remux_url = stream_info.current_url or stream_info.original_url
+                    logger.info(
+                        f"Stream {stream_id} has separate audio tracks in HLS master playlist - "
+                        f"auto-upgrading to FFmpeg remux for IPTV client compatibility "
+                        f"(url: {remux_url})"
+                    )
+                    stream_info.is_transcoded = True
+                    stream_info.transcode_profile = "auto-remux"
+                    stream_info.transcode_ffmpeg_args = [
+                        "-i", remux_url,
+                        "-c:v", "copy",
+                        "-c:a", "copy",
+                        "-f", "mpegts",
+                        "pipe:1",
+                    ]
+                    stream_info.auto_remux = True
+                    # Re-enter via the transcoded path at the top of this method
+                    return await self.get_playlist_content(
+                        stream_id, client_id, base_proxy_url
                     )
 
                 parsed_url = urlparse(final_url)

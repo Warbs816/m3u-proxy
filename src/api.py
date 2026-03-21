@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query, Response, Request, Depends, Header
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
@@ -1077,16 +1077,42 @@ async def get_hls_playlist(
         # This automatically works with whatever host/scheme the client used
         base_proxy_url = f"{root_path}/hls/{stream_id}"
 
+        # If this stream was already auto-upgraded to FFmpeg remux (separate audio
+        # tracks detected on a previous request), redirect straight to the direct
+        # stream endpoint which serves the muxed MPEG-TS output from FFmpeg.
+        stream_info = stream_manager.streams.get(stream_id)
+        if stream_info and stream_info.auto_remux:
+            root_path = getattr(settings, "ROOT_PATH", "")
+            redirect_url = f"{root_path}/stream/{stream_id}"
+            if client_id:
+                redirect_url += f"?client_id={client_id}"
+            logger.info(
+                f"Stream {stream_id} is auto-remuxed (separate audio) - "
+                f"redirecting client {client_id} to direct stream endpoint"
+            )
+            return RedirectResponse(url=redirect_url, status_code=302)
+
         # Get processed playlist content (works for both direct HLS and transcoded HLS)
         content = await stream_manager.get_playlist_content(
             stream_id, client_id, base_proxy_url
         )
 
+        # If auto-remux was just triggered during get_playlist_content,
+        # redirect to the direct stream endpoint
+        stream_info = stream_manager.streams.get(stream_id)
+        if stream_info and stream_info.auto_remux:
+            root_path = getattr(settings, "ROOT_PATH", "")
+            redirect_url = f"{root_path}/stream/{stream_id}"
+            if client_id:
+                redirect_url += f"?client_id={client_id}"
+            logger.info(
+                f"Stream {stream_id} auto-upgraded to FFmpeg remux (separate audio tracks) - "
+                f"redirecting client {client_id} to direct stream endpoint"
+            )
+            return RedirectResponse(url=redirect_url, status_code=302)
+
         if content is None:
             raise HTTPException(status_code=503, detail="Playlist not available")
-
-        # Check if this is a transcoded stream for logging purposes
-        stream_info = stream_manager.streams.get(stream_id)
         stream_type = (
             "transcoded HLS"
             if stream_info and stream_info.is_transcoded
