@@ -528,6 +528,7 @@ class StreamManager:
             active_clients = len(self.stream_clients.get(stream_id, set()))
             if active_clients == 0:
                 old_stream = self.streams[stream_id]
+                was_recycled = True
                 recycled_bytes = old_stream.total_bytes_served
                 recycled_segments = old_stream.total_segments_served
                 recycled_created_at = old_stream.created_at
