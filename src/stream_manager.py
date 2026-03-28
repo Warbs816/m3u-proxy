@@ -1281,7 +1281,9 @@ class StreamManager:
             elif stream_info.failover_urls:
                 max_failovers = len(stream_info.failover_urls)
             elif stream_info.failover_resolver_url:
-                max_failovers = 999  # Resolver-based: let the resolver decide when to stop
+                max_failovers = (
+                    999  # Resolver-based: let the resolver decide when to stop
+                )
             else:
                 max_failovers = 3  # No failovers configured, keep original default
             max_vod_reconnects = 5
@@ -2900,7 +2902,9 @@ class StreamManager:
             elif stream_info.failover_urls:
                 max_failovers = len(stream_info.failover_urls)
             elif stream_info.failover_resolver_url:
-                max_failovers = 999  # Resolver-based: let the resolver decide when to stop
+                max_failovers = (
+                    999  # Resolver-based: let the resolver decide when to stop
+                )
             else:
                 max_failovers = 3  # No failovers configured, keep original default
             is_failover = False  # Track if we broke due to failover
@@ -3159,7 +3163,9 @@ class StreamManager:
                                 await self._try_update_failover_url(
                                     stream_id, "transcode_runtime_input_error"
                                 )
-                                is_failover = True  # Keep client connection alive during failover
+                                is_failover = (
+                                    True  # Keep client connection alive during failover
+                                )
                                 failover_count += 1
                                 break
                             else:
