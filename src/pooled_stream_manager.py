@@ -5,6 +5,7 @@ Implements connection pooling and multi-worker coordination.
 
 import asyncio
 import json
+import math
 import time
 import uuid
 import hashlib
@@ -23,6 +24,72 @@ try:
 except ImportError:
     REDIS_AVAILABLE = False
     logger.warning("Redis not available - falling back to single-worker mode")
+
+
+async def probe_duration(
+    url: str,
+    user_agent: Optional[str] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: float = 10.0,
+) -> Optional[float]:
+    """Run ffprobe to get the duration of a media source.
+
+    Returns duration in seconds, or None if ffprobe fails or times out.
+    """
+    cmd = [
+        "ffprobe",
+        "-v", "quiet",
+        "-print_format", "json",
+        "-show_format",
+        "-show_entries", "format=duration",
+    ]
+
+    # Pass the same auth that ffmpeg would use for network inputs
+    is_network = isinstance(url, str) and "://" in url and not url.startswith("file://")
+    if user_agent and is_network:
+        cmd.extend(["-user_agent", user_agent])
+    if headers and is_network:
+        header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
+        cmd.extend(["-headers", header_str])
+
+    cmd.append(url)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+
+        if proc.returncode != 0:
+            logger.warning(
+                f"ffprobe failed for {url}: exit code {proc.returncode}, "
+                f"stderr={stderr.decode('utf-8', errors='ignore')[:200]}"
+            )
+            return None
+
+        data = json.loads(stdout.decode("utf-8", errors="ignore"))
+        duration_str = data.get("format", {}).get("duration")
+        if duration_str:
+            duration = float(duration_str)
+            logger.info(f"ffprobe detected duration: {duration:.2f}s for {url}")
+            return duration
+
+        logger.warning(f"ffprobe returned no duration for {url}")
+        return None
+
+    except asyncio.TimeoutError:
+        logger.warning(f"ffprobe timed out after {timeout}s for {url}")
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        return None
+    except Exception as e:
+        logger.warning(f"ffprobe error for {url}: {e}")
+        return None
 
 
 class SharedTranscodingProcess:
@@ -63,6 +130,16 @@ class SharedTranscodingProcess:
 
         self.last_chunk_time = time.time()  # Track when last chunk was produced
         self.output_timeout = 30  # Seconds without output before considering failed
+
+        # VOD seek bar support: pre-built manifest and seek tracking
+        self.source_duration: Optional[float] = None  # Duration from ffprobe (seconds)
+        self.prebuilt_manifest: Optional[str] = None  # Complete VOD manifest
+        self.total_segments: int = 0  # Total expected segments
+        self.segment_duration: float = 6.0  # Segment length (parsed from ffmpeg args)
+        self.highest_segment: int = -1  # Highest segment number on disk
+        self._seek_lock = asyncio.Lock()  # Prevent concurrent seek restarts
+        self._last_seek_time: float = 0.0  # Debounce rapid seeks
+        self._active_waiters: int = 0  # Number of in-flight wait_for_segment calls
         # Detect output mode (stdout stream vs HLS files)
         self.mode = "stdout"
         self.hls_dir: Optional[str] = None
@@ -167,6 +244,32 @@ class SharedTranscodingProcess:
         try:
             logger.info(f"Starting shared FFmpeg process for stream {self.stream_id}")
 
+            # For HLS VOD mode: probe duration and pre-build manifest for seek bar support
+            if self.mode == "hls" and not self.prebuilt_manifest and not self.source_duration:
+                self.segment_duration = self._parse_segment_duration()
+                duration = await probe_duration(
+                    self.url, self.user_agent, self.headers
+                )
+                if duration and duration > 0:
+                    self.source_duration = duration
+                    # Force HLS args compatible with VOD before building manifest
+                    # so segment naming is guaranteed to match
+                    self._force_vod_hls_args()
+                    self.prebuilt_manifest = self._build_vod_manifest(
+                        duration, self.segment_duration
+                    )
+                    self.total_segments = max(1, math.ceil(duration / self.segment_duration))
+                    logger.info(
+                        f"Pre-built VOD manifest for stream {self.stream_id}: "
+                        f"duration={duration:.1f}s, segments={self.total_segments}, "
+                        f"segment_duration={self.segment_duration}s"
+                    )
+                else:
+                    logger.info(
+                        f"No duration from ffprobe for stream {self.stream_id}, "
+                        f"falling back to progressive manifest"
+                    )
+
             # Build FFmpeg command - ensure output to stdout
             ffmpeg_cmd = ["ffmpeg"]
 
@@ -187,23 +290,24 @@ class SharedTranscodingProcess:
                 header_str = "".join([f"{k}: {v}\r\n" for k, v in self.headers.items()])
                 ffmpeg_cmd.extend(["-headers", header_str])
 
-            # Process ffmpeg_args and insert HLS-specific options right before -i flag
+            # Process ffmpeg_args and insert options right before -i flag
             # For HLS inputs with extensionless segment URLs, we need special handling
             processed_args = []
             is_hls_input = isinstance(self.url, str) and self.url.lower().endswith(
                 ".m3u8"
             )
+            is_network_input = isinstance(self.url, str) and (
+                "://" in self.url and not self.url.startswith("file://")
+            )
             i = 0
             while i < len(self.ffmpeg_args):
                 arg = self.ffmpeg_args[i]
                 if arg == "-i" and i + 1 < len(self.ffmpeg_args):
-                    # Found -i flag - inject HLS options right before it if needed
-                    if is_hls_input:
-                        # Add protocol whitelist to allow http/https URLs in playlists
-                        processed_args.extend(
-                            ["-protocol_whitelist", "file,http,https,tcp,tls,crypto"]
-                        )
-                        # Enable following HTTP redirects for HLS streams
+                    # Found -i flag - inject options right before it if needed
+
+                    # Enable reconnection for ALL network inputs (HTTP, RTSP, etc.)
+                    # so transient I/O errors don't kill the transcode
+                    if is_network_input:
                         processed_args.extend(
                             [
                                 "-reconnect",
@@ -211,8 +315,14 @@ class SharedTranscodingProcess:
                                 "-reconnect_streamed",
                                 "1",
                                 "-reconnect_delay_max",
-                                "2",
+                                "5",
                             ]
+                        )
+
+                    if is_hls_input:
+                        # Add protocol whitelist to allow http/https URLs in playlists
+                        processed_args.extend(
+                            ["-protocol_whitelist", "file,http,https,tcp,tls,crypto"]
                         )
                         # Allow any extensions (including extensionless) for segments
                         processed_args.extend(["-allowed_extensions", "ALL"])
@@ -446,6 +556,14 @@ class SharedTranscodingProcess:
                     self.last_chunk_time = time.time()
                     for f in new_files:
                         known.add(f)
+                        # Track highest segment number for seek decisions
+                        if f.startswith("segment_") and f.endswith(".ts"):
+                            try:
+                                seg_num = int(f.split("_")[1].split(".")[0])
+                                if seg_num > self.highest_segment:
+                                    self.highest_segment = seg_num
+                            except (IndexError, ValueError):
+                                pass
                 await asyncio.sleep(0.5)
         except Exception as e:
             logger.debug(f"HLS watch loop ended for {self.stream_id}: {e}")
@@ -591,7 +709,12 @@ class SharedTranscodingProcess:
             logger.error(f"Error reading FFmpeg stderr for {self.stream_id}: {e}")
 
     async def read_playlist(self) -> Optional[str]:
-        """Read the generated HLS playlist (index.m3u8) if available"""
+        """Read the HLS playlist. Returns the pre-built VOD manifest when available,
+        otherwise falls back to reading ffmpeg's progressive manifest from disk."""
+        # If we have a pre-built manifest (from ffprobe duration), always use it
+        if self.prebuilt_manifest:
+            return self.prebuilt_manifest
+
         if not self.hls_dir:
             return None
         playlist_path = os.path.join(self.hls_dir, "index.m3u8")
@@ -610,6 +733,282 @@ class SharedTranscodingProcess:
         if os.path.exists(candidate):
             return candidate
         return None
+
+    def _parse_segment_duration(self) -> float:
+        """Parse -hls_time value from ffmpeg_args, default 6.0."""
+        for i, arg in enumerate(self.ffmpeg_args):
+            if arg == "-hls_time" and i + 1 < len(self.ffmpeg_args):
+                try:
+                    return float(self.ffmpeg_args[i + 1])
+                except (ValueError, IndexError):
+                    pass
+        return 6.0
+
+    def _build_vod_manifest(self, duration_seconds: float, segment_duration: float) -> str:
+        """Build a complete VOD HLS manifest for the given duration.
+
+        The manifest lists all segments upfront with #EXT-X-ENDLIST so players
+        show a seek bar from the start, even before ffmpeg has produced every segment.
+        """
+        total_segments = max(1, math.ceil(duration_seconds / segment_duration))
+        target_duration = math.ceil(segment_duration)
+
+        lines = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:3",
+            f"#EXT-X-TARGETDURATION:{target_duration}",
+            "#EXT-X-MEDIA-SEQUENCE:0",
+            "#EXT-X-PLAYLIST-TYPE:VOD",
+        ]
+
+        remaining = duration_seconds
+        for i in range(total_segments):
+            seg_dur = min(segment_duration, remaining)
+            # Ensure last segment has a positive duration
+            if seg_dur <= 0:
+                seg_dur = segment_duration
+            lines.append(f"#EXTINF:{seg_dur:.6f},")
+            lines.append(f"segment_{i:06d}.ts")
+            remaining -= segment_duration
+
+        lines.append("#EXT-X-ENDLIST")
+        lines.append("")  # trailing newline
+
+        return "\n".join(lines)
+
+    def _force_vod_hls_args(self):
+        """Override HLS-related ffmpeg args to ensure all segments stay on disk.
+
+        When a pre-built VOD manifest is active, we need:
+        - ``-hls_list_size 0`` so ffmpeg doesn't rotate/delete old segments
+        - ``-hls_playlist_type vod`` so ffmpeg writes a proper VOD playlist on disk
+        - ``-hls_segment_filename`` as absolute path so segments land in hls_dir
+        - ``-hls_flags delete_segments`` removed if present (prevents segment deletion)
+        """
+        # Build absolute segment filename — ffmpeg resolves relative paths
+        # against its CWD, NOT the output file directory
+        segment_pattern = os.path.join(
+            self.hls_dir or "", "segment_%06d.ts"
+        )
+
+        new_args = []
+        i = 0
+        while i < len(self.ffmpeg_args):
+            arg = self.ffmpeg_args[i]
+            if arg == "-hls_list_size" and i + 1 < len(self.ffmpeg_args):
+                # Replace with 0 (keep all segments)
+                new_args.extend(["-hls_list_size", "0"])
+                i += 2
+                continue
+            if arg == "-hls_playlist_type" and i + 1 < len(self.ffmpeg_args):
+                # Replace with vod
+                new_args.extend(["-hls_playlist_type", "vod"])
+                i += 2
+                continue
+            if arg == "-hls_segment_filename" and i + 1 < len(self.ffmpeg_args):
+                # Force absolute path with 6-digit naming to match pre-built manifest
+                new_args.extend(["-hls_segment_filename", segment_pattern])
+                i += 2
+                continue
+            if arg == "-hls_flags" and i + 1 < len(self.ffmpeg_args):
+                # Remove delete_segments from flags if present
+                flags = self.ffmpeg_args[i + 1]
+                cleaned = "+".join(
+                    f for f in flags.split("+") if f != "delete_segments"
+                )
+                if cleaned:
+                    new_args.extend(["-hls_flags", cleaned])
+                # else: drop -hls_flags entirely if only delete_segments was set
+                i += 2
+                continue
+            new_args.append(arg)
+            i += 1
+
+        # Add missing args if they weren't in the original command
+        has_list_size = any(a == "-hls_list_size" for a in new_args)
+        has_playlist_type = any(a == "-hls_playlist_type" for a in new_args)
+        has_segment_filename = any(a == "-hls_segment_filename" for a in new_args)
+
+        if not has_list_size:
+            new_args.insert(-1, "-hls_list_size")
+            new_args.insert(-1, "0")
+        if not has_playlist_type:
+            new_args.insert(-1, "-hls_playlist_type")
+            new_args.insert(-1, "vod")
+        if not has_segment_filename:
+            new_args.insert(-1, "-hls_segment_filename")
+            new_args.insert(-1, segment_pattern)
+
+        self.ffmpeg_args = new_args
+
+    async def wait_for_segment(
+        self,
+        segment_name: str,
+        timeout: float = 60.0,
+        heartbeat_callback=None,
+    ) -> Optional[str]:
+        """Wait for a segment to appear on disk, seeking ffmpeg forward if needed.
+
+        Args:
+            segment_name: The segment filename (e.g. segment_000042.ts).
+            timeout: Maximum seconds to wait.
+            heartbeat_callback: Optional callable invoked each poll iteration so
+                callers can keep their own timeouts (e.g. client last_access) fresh.
+
+        Returns the absolute file path once available, or None on timeout.
+        """
+        if not self.hls_dir:
+            return None
+
+        segment_path = os.path.join(self.hls_dir, segment_name)
+
+        # Already on disk — fast path
+        if os.path.exists(segment_path):
+            return segment_path
+
+        # Not a seekable VOD stream — no point waiting
+        if not self.prebuilt_manifest:
+            return None
+
+        # Extract segment number
+        try:
+            seg_num = int(segment_name.split("_")[1].split(".")[0])
+        except (IndexError, ValueError):
+            return None
+
+        # Track that a segment wait is in progress so cleanup doesn't kill us
+        self._active_waiters += 1
+        try:
+            # Decide: wait for ffmpeg to catch up, or seek ahead
+            SEEK_THRESHOLD = 3  # segments
+            if self.highest_segment >= 0 and seg_num > self.highest_segment + SEEK_THRESHOLD:
+                # Segment is far ahead — restart ffmpeg at the target position
+                await self._seek_to_segment(seg_num)
+
+            # Poll for the segment to appear
+            poll_interval = 0.3
+            waited = 0.0
+            while waited < timeout:
+                if os.path.exists(segment_path):
+                    # Wait briefly for ffmpeg to finish writing the segment
+                    await asyncio.sleep(0.1)
+                    return segment_path
+
+                # If ffmpeg has exited and the segment still doesn't exist, give up
+                if self.process and self.process.returncode is not None:
+                    return None
+
+                # Keep the process alive — update timestamps so cleanup loops
+                # don't consider this stream stale while we're actively waiting
+                self.last_access = time.time()
+                self.last_chunk_time = time.time()
+
+                # Let the caller refresh its own timeouts (e.g. client last_access)
+                if heartbeat_callback:
+                    try:
+                        heartbeat_callback()
+                    except Exception:
+                        pass
+
+                await asyncio.sleep(poll_interval)
+                waited += poll_interval
+
+            logger.warning(
+                f"Timed out waiting for segment {segment_name} after {timeout}s "
+                f"(highest_segment={self.highest_segment}, stream={self.stream_id})"
+            )
+            return None
+        finally:
+            self._active_waiters -= 1
+
+    async def _seek_to_segment(self, target_segment: int):
+        """Restart ffmpeg with -ss to transcode from a specific position."""
+        async with self._seek_lock:
+            # Debounce: don't restart if we just did
+            if time.time() - self._last_seek_time < 2.0:
+                logger.debug(
+                    f"Skipping seek to segment {target_segment}: debounce (last seek {time.time() - self._last_seek_time:.1f}s ago)"
+                )
+                return
+
+            # If the segment is already on disk (maybe another seek produced it), skip
+            expected_file = os.path.join(self.hls_dir, f"segment_{target_segment:06d}.ts")
+            if os.path.exists(expected_file):
+                return
+
+            seek_seconds = max(0, target_segment * self.segment_duration - self.segment_duration)
+            logger.info(
+                f"Seeking ffmpeg to segment {target_segment} (t={seek_seconds:.1f}s) for stream {self.stream_id}"
+            )
+
+            # 1. Kill current ffmpeg process
+            if self.process and self.process.returncode is None:
+                try:
+                    self.process.terminate()
+                    await asyncio.wait_for(self.process.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    self.process.kill()
+                    await self.process.wait()
+                except Exception as e:
+                    logger.warning(f"Error stopping ffmpeg for seek: {e}")
+
+            # 2. Cancel the existing watch loop
+            if self._broadcaster_task and not self._broadcaster_task.done():
+                self._broadcaster_task.cancel()
+                try:
+                    await self._broadcaster_task
+                except asyncio.CancelledError:
+                    pass
+
+            # 3. Rebuild ffmpeg args with -ss, -output_ts_offset, and -start_number
+            #    Strip any existing seek-related flags from prior seeks
+            new_args = []
+            i = 0
+            while i < len(self.ffmpeg_args):
+                arg = self.ffmpeg_args[i]
+                if arg in ("-ss", "-start_number", "-output_ts_offset") and i + 1 < len(self.ffmpeg_args):
+                    # Strip previous seek flags (will re-insert below)
+                    i += 2
+                elif arg == "-i" and i + 1 < len(self.ffmpeg_args):
+                    # Insert -ss before -i for fast input seeking
+                    new_args.extend(["-ss", f"{seek_seconds:.3f}"])
+                    new_args.append(arg)
+                    new_args.append(self.ffmpeg_args[i + 1])
+                    # Insert -output_ts_offset AFTER -i so output timestamps
+                    # match the seek position (without this, -ss resets PTS to 0
+                    # and the player's seek bar breaks)
+                    new_args.extend(["-output_ts_offset", f"{seek_seconds:.3f}"])
+                    i += 2
+                else:
+                    new_args.append(arg)
+                    i += 1
+
+            # Insert -start_number so segment filenames match the pre-built manifest
+            # Find a good spot: right before -hls_segment_filename or at the end of HLS flags
+            insert_idx = None
+            for idx, a in enumerate(new_args):
+                if a == "-hls_segment_filename":
+                    insert_idx = idx
+                    break
+            if insert_idx is not None:
+                new_args.insert(insert_idx, str(target_segment))
+                new_args.insert(insert_idx, "-start_number")
+            else:
+                # Append before the output filename (last arg)
+                new_args.insert(-1, "-start_number")
+                new_args.insert(-1, str(target_segment))
+
+            # 4. Swap args and restart
+            original_args = self.ffmpeg_args
+            self.ffmpeg_args = new_args
+            self.status = "running"
+            self._last_seek_time = time.time()
+
+            success = await self.start_process()
+            if not success:
+                logger.error(f"Failed to restart ffmpeg after seek for stream {self.stream_id}")
+                # Restore original args so a retry can try again
+                self.ffmpeg_args = original_args
 
     async def add_client(self, client_id: str) -> asyncio.Queue:
         """Add a client to this shared process and return their queue"""
@@ -650,6 +1049,9 @@ class SharedTranscodingProcess:
 
     def should_cleanup(self, timeout: int = 300) -> bool:
         """Check if this process should be cleaned up (no clients for timeout seconds)"""
+        # Never clean up while segment requests are actively waiting for transcoding
+        if self._active_waiters > 0:
+            return False
         return not self.clients and (time.time() - self.last_access > timeout)
 
     def health_check(self):
@@ -844,6 +1246,14 @@ class PooledStreamManager:
         self._cleanup_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._running = False
+
+    def get_process_by_stream_id(self, stream_id: str) -> Optional[SharedTranscodingProcess]:
+        """Look up a SharedTranscodingProcess by its external stream_id."""
+        for key, sid in self.stream_key_to_id.items():
+            if sid == stream_id and key in self.shared_processes:
+                return self.shared_processes[key]
+        # Fallback: stream_key might be the stream_id itself
+        return self.shared_processes.get(stream_id)
 
     def set_event_manager(self, event_manager):
         """Set the event manager for emitting events"""
