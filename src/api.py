@@ -1851,6 +1851,8 @@ async def delete_oldest_stream_by_metadata(
                 stream_key = stream_manager.pooled_manager._generate_stream_key(
                     stream_info.current_url or stream_info.original_url,
                     stream_info.transcode_profile or "default",
+                    ffmpeg_args=stream_info.transcode_ffmpeg_args,
+                    metadata=stream_info.metadata,
                 )
                 await stream_manager.pooled_manager.force_stop_stream(stream_key)
             except Exception as e:
@@ -1954,6 +1956,8 @@ async def delete_streams_by_metadata(
                         stream_key = stream_manager.pooled_manager._generate_stream_key(
                             stream_info.current_url or stream_info.original_url,
                             stream_info.transcode_profile or "default",
+                            ffmpeg_args=stream_info.transcode_ffmpeg_args,
+                            metadata=stream_info.metadata,
                         )
                         await stream_manager.pooled_manager.force_stop_stream(
                             stream_key
@@ -2023,6 +2027,8 @@ async def delete_stream(stream_id: str):
             stream_key = stream_manager.pooled_manager._generate_stream_key(
                 stream_info.current_url or stream_info.original_url,
                 stream_info.transcode_profile or "default",
+                ffmpeg_args=stream_info.transcode_ffmpeg_args,
+                metadata=stream_info.metadata,
             )
             await stream_manager.pooled_manager.force_stop_stream(stream_key)
 

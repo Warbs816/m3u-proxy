@@ -36,6 +36,7 @@ class SharedTranscodingProcess:
         ffmpeg_args: List[str],
         user_agent: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         hls_base_dir: Optional[str] = None,
     ):
         self.stream_id = stream_id
@@ -44,6 +45,7 @@ class SharedTranscodingProcess:
         self.ffmpeg_args = ffmpeg_args
         self.user_agent = user_agent
         self.headers = headers or {}
+        self.metadata = metadata or {}
         # Base directory to create HLS per-stream directories in. If None,
         # the process will fall back to the system tempdir.
         self.hls_base_dir = hls_base_dir
@@ -72,7 +74,9 @@ class SharedTranscodingProcess:
             or "-f hls" in joined_args
         ):
             self.mode = "hls"
-            # Determine base dir for HLS output
+
+        if self.mode == "hls":
+            # Determine base dir for file-based outputs
             base_dir = None
             if self.hls_base_dir:
                 base_dir = self.hls_base_dir
@@ -89,6 +93,7 @@ class SharedTranscodingProcess:
                 except Exception:
                     pass
 
+        if self.mode == "hls":
             # Create a per-stream directory for HLS segments
             try:
                 self.hls_dir = tempfile.mkdtemp(
@@ -280,7 +285,7 @@ class SharedTranscodingProcess:
             if self.mode == "stdout":
                 self._broadcaster_task = asyncio.create_task(self._broadcast_loop())
             else:
-                # In HLS mode, start a small watcher task to update last_chunk_time
+                # In HLS mode, watch for new segments to update last_chunk_time
                 self._broadcaster_task = asyncio.create_task(self._hls_watch_loop())
 
             return True
@@ -561,7 +566,7 @@ class SharedTranscodingProcess:
         return self.status == "running" and self.process is not None
 
     async def cleanup(self):
-        """Clean up the FFmpeg process and HLS directory"""
+        """Clean up the FFmpeg process and any output artifacts"""
         # Fix #5: Improved cleanup with better error handling and logging
         try:
             if self.process and self.process.returncode is None:
@@ -583,7 +588,7 @@ class SharedTranscodingProcess:
             self.status = "stopped"
             self.clients.clear()
         finally:
-            # Fix #5: Always attempt HLS cleanup in finally block to ensure it runs even if FFmpeg cleanup fails
+            # Always attempt HLS cleanup in finally block to ensure it runs even if FFmpeg cleanup fails
             await self._cleanup_hls_directory()
 
     async def _cleanup_hls_directory(self):
@@ -1014,10 +1019,25 @@ class PooledStreamManager:
         except Exception as e:
             logger.error(f"Error while running HLS GC: {e}")
 
-    def _generate_stream_key(self, url: str, profile: str) -> str:
-        """Generate a consistent key for stream sharing"""
-        # Create a hash of URL + profile for consistent stream sharing
-        data = f"{url}|{profile}"
+    def _generate_stream_key(
+        self,
+        url: str,
+        profile: str,
+        ffmpeg_args: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Generate a consistent key for stream sharing.
+
+        The key includes the detected output mode (hls / file / direct) so
+        that two transcoded streams with the same URL and profile name but
+        different delivery formats (e.g. MPEGTS pipe vs HLS segments) are
+        never incorrectly pooled together.  This matters when both profiles
+        resolve to the same name (e.g. "custom" for user-provided templates).
+        """
+        from stream_manager import StreamManager
+
+        output_mode = StreamManager._detect_output_mode(ffmpeg_args)
+        data = f"{url}|{profile}|{output_mode}"
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
     async def get_or_create_shared_stream(
@@ -1028,6 +1048,7 @@ class PooledStreamManager:
         client_id: str,
         user_agent: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         stream_id: Optional[str] = None,
         reuse_stream_key: Optional[str] = None,
     ) -> Tuple[str, SharedTranscodingProcess]:
@@ -1039,7 +1060,9 @@ class PooledStreamManager:
                               same stream key even though the URL has changed.
         """
 
-        stream_key = reuse_stream_key or self._generate_stream_key(url, profile)
+        stream_key = reuse_stream_key or self._generate_stream_key(
+            url, profile, ffmpeg_args=ffmpeg_args, metadata=metadata
+        )
 
         # Track the stream_id -> stream_key mapping for event emission
         if stream_id:
@@ -1096,6 +1119,7 @@ class PooledStreamManager:
             ffmpeg_args,
             user_agent=user_agent,
             headers=headers,
+            metadata=metadata,
             hls_base_dir=self.hls_base_dir,
         )
 

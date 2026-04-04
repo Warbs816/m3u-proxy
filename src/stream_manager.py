@@ -466,6 +466,27 @@ class StreamManager:
         # Default: treat as live continuous
         return (False, False, True)
 
+    @staticmethod
+    def _detect_output_mode(
+        ffmpeg_args: Optional[List[str]] = None,
+    ) -> str:
+        """Detect whether FFmpeg will produce HLS or direct (stdout) output.
+
+        Used to differentiate stream IDs and pooling keys so that two
+        transcoded streams for the same source URL but different output
+        formats (e.g. MPEGTS pipe vs HLS segments) never collide.
+        """
+        if ffmpeg_args:
+            joined = " ".join(str(a).lower() for a in ffmpeg_args)
+            if (
+                "-hls_time" in joined
+                or "-hls_list_size" in joined
+                or "-f hls" in joined
+            ):
+                return "hls"
+
+        return "direct"
+
     async def get_or_create_stream(
         self,
         stream_url: str,
@@ -511,7 +532,18 @@ class StreamManager:
         """
         import hashlib
 
-        stream_id = hashlib.md5(stream_url.encode()).hexdigest()
+        # Include transcoding info in the stream ID so that a direct stream and
+        # a transcoded stream (or two differently-transcoded streams) for the
+        # same source URL get distinct IDs.  Without this, the second request
+        # silently reuses the first StreamInfo — which has wrong is_transcoded /
+        # transcode_profile / transcode_ffmpeg_args — causing the client to
+        # receive the wrong output format.
+        if is_transcoded:
+            output_mode = self._detect_output_mode(transcode_ffmpeg_args)
+            key_data = f"{stream_url}|transcoded|{transcode_profile or 'default'}|{output_mode}"
+            stream_id = hashlib.md5(key_data.encode()).hexdigest()
+        else:
+            stream_id = hashlib.md5(stream_url.encode()).hexdigest()
 
         # If the stream exists but has no active clients, it's orphaned from a
         # previous session.  Delete it so we get a fresh StreamInfo below —
@@ -2932,6 +2964,7 @@ class StreamManager:
                         client_id=client_id,
                         user_agent=stream_info.user_agent,
                         headers=stream_info.headers,
+                        metadata=stream_info.metadata,
                         stream_id=stream_id,
                         # Reuse existing key if available
                         reuse_stream_key=stream_info.transcode_stream_key,
@@ -3527,6 +3560,7 @@ class StreamManager:
                     client_id=client_id,
                     user_agent=stream_info.user_agent,
                     headers=stream_info.headers,
+                    metadata=stream_info.metadata,
                     stream_id=stream_id,
                     # Reuse existing key if available
                     reuse_stream_key=stream_info.transcode_stream_key,
