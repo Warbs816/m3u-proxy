@@ -10,8 +10,6 @@ Feel free to [open an issue](https://github.com/m3ue/m3u-proxy/issues/new?templa
 
 ### Join us on Discord
 
-[![](https://dcbadge.limes.pink/api/server/rS3abJ5dz7)](https://discord.gg/rS3abJ5dz7)
-
 Join our [Discord](https://discord.gg/rS3abJ5dz7) server to ask questions and get help, help others, suggest new ideas, and offer suggestions for improvements! You can also try out and help test new features! 🎉
 
 ## Features
