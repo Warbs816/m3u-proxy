@@ -706,6 +706,40 @@ async def get_info():
     return info
 
 
+# Known media file extensions that clients may append to /stream/{stream_id}
+# URLs as a classification hint (e.g. SIPTV needs a .mp4/.mkv suffix to treat
+# a stream as VOD and enable seeking). The underlying stream is identified
+# solely by the hash-based stream_id, so we strip any trailing known extension
+# before looking it up. Entries are matched case-insensitively in listed order
+# — longer overlapping extensions must come first (`.m2ts` before `.ts`).
+STREAM_ID_MEDIA_EXTENSIONS = (
+    ".m2ts",
+    ".webm",
+    ".mkv",
+    ".mp4",
+    ".avi",
+    ".mov",
+    ".mp3",
+    ".aac",
+    ".ts",
+    ".m3u8",
+)
+
+
+def strip_stream_id_extension(stream_id: str) -> str:
+    """Strip a trailing known media file extension from a stream_id.
+
+    The stream_id is an MD5 hex hash and never naturally contains a dot, so this
+    is a safe operation. Unknown extensions are left alone so the existing 404
+    path remains reachable for genuinely invalid ids.
+    """
+    lowered = stream_id.lower()
+    for ext in STREAM_ID_MEDIA_EXTENSIONS:
+        if lowered.endswith(ext):
+            return stream_id[: -len(ext)]
+    return stream_id
+
+
 async def resolve_stream_id(
     stream_id: str,
     url: Optional[str] = Query(
@@ -738,6 +772,10 @@ async def resolve_stream_id(
             raise HTTPException(
                 status_code=500, detail="Failed to process stream from URL"
             )
+
+    # Clients may append a media extension (e.g. .mp4, .mkv, .ts) so they can
+    # classify the stream type from the URL alone. Strip it before lookup.
+    stream_id = strip_stream_id_extension(stream_id)
 
     if stream_id not in stream_manager.streams:
         raise HTTPException(status_code=404, detail="Stream not found")

@@ -1,6 +1,6 @@
 # Add src to path first
 from stream_manager import StreamManager
-from api import app, get_content_type, is_direct_stream
+from api import app, get_content_type, is_direct_stream, strip_stream_id_extension
 import httpx
 import asyncio
 import pytest
@@ -33,6 +33,23 @@ class TestHelperFunctions:
         assert is_direct_stream("video.avi") is True
         assert is_direct_stream("playlist.m3u8") is False
         assert is_direct_stream("unknown.xyz") is False
+
+    def test_strip_stream_id_extension(self):
+        # Bare hashes pass through unchanged
+        assert strip_stream_id_extension("abc123") == "abc123"
+        # Known video extensions get stripped (lowercased comparison)
+        assert strip_stream_id_extension("abc123.mp4") == "abc123"
+        assert strip_stream_id_extension("abc123.MKV") == "abc123"
+        assert strip_stream_id_extension("abc123.ts") == "abc123"
+        assert strip_stream_id_extension("abc123.m2ts") == "abc123"
+        assert strip_stream_id_extension("abc123.webm") == "abc123"
+        assert strip_stream_id_extension("abc123.avi") == "abc123"
+        assert strip_stream_id_extension("abc123.mov") == "abc123"
+        assert strip_stream_id_extension("abc123.m3u8") == "abc123"
+        # Unknown extensions are left alone so 404s remain correct
+        assert strip_stream_id_extension("abc123.xyz") == "abc123.xyz"
+        # Ensure .m2ts is matched before .ts (longer suffix wins)
+        assert strip_stream_id_extension("hashwithm2ts.m2ts") == "hashwithm2ts"
 
 
 class TestAPI:
@@ -269,6 +286,45 @@ class TestAPI:
 
         response = client.get("/stream/test_stream_123")
         assert response.status_code == 200
+
+    def test_direct_stream_endpoint_with_media_extension(
+        self, client, mock_stream_manager
+    ):
+        """Clients append a media extension (.mkv/.mp4/.ts) to classify the
+        stream type. The stream_id must still resolve after the suffix is
+        stripped."""
+        from starlette.responses import StreamingResponse
+
+        async def mock_stream_generator():
+            yield b"stream_data_chunk_1"
+
+        mock_response = StreamingResponse(
+            mock_stream_generator(), media_type="video/x-matroska"
+        )
+
+        mock_stream_manager.stream_continuous_direct = AsyncMock(
+            return_value=mock_response
+        )
+        mock_stream_manager.stream_transcoded = AsyncMock(return_value=mock_response)
+        mock_stream_manager.register_client = AsyncMock(return_value=None)
+        mock_stream_manager.unregister_client = AsyncMock(return_value=None)
+        mock_stream_manager.get_stream_info = Mock(return_value=None)
+        mock_stream_manager.clients = {}
+
+        for suffix in (".mkv", ".mp4", ".ts", ".MKV"):
+            response = client.get(f"/stream/test_stream_123{suffix}")
+            assert response.status_code == 200, (
+                f"expected 200 for /stream/test_stream_123{suffix}, got {response.status_code}"
+            )
+
+    def test_direct_stream_endpoint_rejects_unknown_extension(
+        self, client, mock_stream_manager
+    ):
+        """Unknown suffixes are not stripped, so invalid stream_ids still 404."""
+        mock_stream_manager.clients = {}
+
+        response = client.get("/stream/test_stream_123.xyz")
+        assert response.status_code == 404
 
     def test_direct_stream_endpoint_recovers_from_redirect_502(self, monkeypatch):
         """API regression: /stream recovers when sticky redirected upstream returns 502 on reconnect."""
